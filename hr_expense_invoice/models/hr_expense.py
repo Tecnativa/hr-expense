@@ -5,13 +5,14 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 from odoo import Command, api, fields, models
+from odoo.tools.misc import clean_context
 from odoo.exceptions import UserError
 
 
 class HrExpense(models.Model):
     _inherit = "hr.expense"
 
-    sheet_id_state = fields.Selection(related="sheet_id.state", string="Sheet state")
+    # sheet_id_state = fields.Selection(related="sheet_id.state", string="Sheet state")
     invoice_id = fields.Many2one(
         comodel_name="account.move",
         string="Vendor Bill",
@@ -19,7 +20,7 @@ class HrExpense(models.Model):
             ("move_type", "=", "in_invoice"),
             ("state", "=", "posted"),
             ("payment_state", "=", "not_paid"),
-            ("expense_ids", "=", False),
+            ("invoice_expense_ids", "=", False),
         ],
         copy=False,
     )
@@ -55,6 +56,7 @@ class HrExpense(models.Model):
             "move_type": "in_invoice",
             "invoice_date": self.date,
             "invoice_line_ids": invoice_lines,
+            "partner_id": self.vendor_id.id,
         }
 
     def _prepare_own_account_transfer_move_vals(self):
@@ -81,7 +83,7 @@ class HrExpense(models.Model):
             "date": self.date,
             "ref": self.name,
             "source_invoice_expense_id": self.id,
-            "expense_sheet_id": self.sheet_id.id,
+            # "expense_sheet_id": self.sheet_id.id,
             "line_ids": [
                 Command.create(
                     {
@@ -111,20 +113,28 @@ class HrExpense(models.Model):
             {
                 "invoice_id": invoice.id,
                 "quantity": 1,
-                "tax_ids": False,
-                "price_unit": invoice.amount_total,
+                # "tax_ids": False,
+                # "price_unit": invoice.amount_total,
             }
         )
+        if self.payment_mode == "company_account":
+            invoice.action_post()
         return True
 
-    @api.constrains("invoice_id")
+    def action_view_transfer_moves(self):
+        self.ensure_one()
+        return self.transfer_move_ids._get_records_action(
+            name=self.env._("Transfer of %s", self.name),
+        )
+
+    @api.constrains("invoice_id", "state", "payment_mode")
     def _check_invoice_id(self):
         for expense in self:  # Only non binding expense
-            if (
-                not expense.sheet_id
-                and expense.invoice_id
-                and expense.invoice_id.state != "posted"
-            ):
+            if expense.state not in ("posted", "in_payment", "paid"):
+                continue
+            if expense.payment_mode == "company_account":
+                continue
+            if expense.invoice_id and expense.invoice_id.state != "posted":
                 raise UserError(self.env._("Vendor bill state must be Posted"))
 
     @api.onchange("invoice_id")
@@ -142,7 +152,7 @@ class HrExpense(models.Model):
                 self.company_id = self.invoice_id.company_id.id
 
     # tax_ids put as dependency for assuring this is computed after setting tax_ids
-    @api.depends("invoice_id", "tax_ids")
+    @api.depends("invoice_id", "invoice_id.amount_total", "tax_ids")
     def _compute_price_unit(self):
         with_invoice = self.filtered("invoice_id")
         for record in with_invoice:
@@ -150,18 +160,18 @@ class HrExpense(models.Model):
         return super(HrExpense, self - with_invoice)._compute_price_unit()
 
     # tax_ids put as dependency for assuring this is computed after setting tax_ids
-    @api.depends("invoice_id", "tax_ids")
+    @api.depends("invoice_id", "invoice_id.amount_total", "tax_ids")
     def _compute_total_amount_currency(self):
         with_invoice = self.filtered("invoice_id")
         for record in with_invoice:
             record.total_amount_currency = record.invoice_id.amount_total
         return super(HrExpense, self - with_invoice)._compute_total_amount_currency()
 
-    @api.depends("invoice_id")
+    @api.depends("invoice_id", "invoice_id.currency_id")
     def _compute_currency_id(self):
         with_invoice = self.filtered("invoice_id")
         for record in with_invoice:
-            record.currency_id = record.invoice_id.currency_id.id
+            record.currency_id = record.invoice_id.currency_id
         return super(HrExpense, self - with_invoice)._compute_currency_id()
 
     @api.depends("invoice_id")
@@ -186,3 +196,128 @@ class HrExpense(models.Model):
                 lambda x: x.account_type in ("asset_receivable", "liability_payable")
             )
             rec.amount_residual = -sum(payment_term_lines.mapped(residual_field))
+
+    def _check_can_create_move(self):
+        res = super()._check_can_create_move()
+        expenses_with_invoices = self.filtered("invoice_id")
+        # Check expenses with transfer movesCollapse comment
+        if exp_w_tranfers := expenses_with_invoices.filtered_domain(
+            [("transfer_move_ids", "!=", False)]
+        ):
+            raise UserError(
+                self.env._(
+                    "You can't create an accounting entry for an expense "
+                    "already linked to a transfer journal entry.\n"
+                    "Please unselect %s and try again.",
+                    ", ".join(exp_w_tranfers.mapped("name")),
+                )
+            )
+        # Check expenses without posted invoices
+        if exp_wo_posted_invoices := expenses_with_invoices.filtered_domain(
+            [("invoice_id.state", "!=", "posted")]
+        ):
+            raise UserError(
+                self.env._(
+                    "You can't create an accounting entry for an expense "
+                    "linked to a vendor bill that is not posted.\n"
+                    "Please post Vendor Bills of %s and try again.",
+                    ", ".join(exp_wo_posted_invoices.mapped("name")),
+                )
+            )
+        return res
+
+    def _check_can_reset_approval(self):
+        expenses_with_invoices = self.filtered("invoice_id")
+        res = super()._check_can_reset_approval()
+        if any(
+            state not in {False, "draft"}
+            for state in expenses_with_invoices.invoice_id.mapped("state")
+        ):
+            raise UserError(
+                self.env._(
+                    "You cannot reset to draft an "
+                    "expense linked to a posted journal entry."
+                )
+            )
+        if any(
+            state not in {False, "draft"}
+            for state in expenses_with_invoices.transfer_move_ids.mapped("state")
+        ):
+            raise UserError(
+                self.env._(
+                    "You cannot reset to draft an "
+                    "expense linked to a posted transfer journal entry."
+                )
+            )
+        return res
+
+    def _reconcile_transfer_moves(self):
+        # Reconcile transfer entries with vendor bills once they are posted
+        self.ensure_one()
+        if self.payment_mode != "own_account":
+            return
+        if not self.invoice_id or not self.transfer_move_ids:
+            raise UserError(
+                self.env._(
+                    "You can't reconcile an expense linked to a "
+                    "Vendor Bill or Transfer that doesn't exist (%s).",
+                    self.name,
+                )
+            )
+        # All transfer moves should be posted
+        vendor_inv_lines = self.invoice_id.line_ids.filtered_domain(
+            [
+                ("display_type", "=", "payment_term"),
+            ]
+        )
+        vendor_transfer_lines = self.transfer_move_ids.line_ids.filtered_domain(
+            [
+                ("partner_id", "=", self.invoice_id.partner_id.id),
+            ]
+        )
+        if vendor_inv_lines and vendor_transfer_lines:
+            (vendor_inv_lines + vendor_transfer_lines).reconcile()
+
+    def _action_expense_create_transfer_moves(self):
+        for expense in self:
+            transfer_move_vals = expense._prepare_own_account_transfer_move_vals()
+            transfer_move = self.env["account.move"].create(transfer_move_vals)
+            transfer_move.action_post()
+            expense._reconcile_transfer_moves()
+
+    def action_post(self):
+        expenses_with_invoices = self.filtered("invoice_id")
+        expenses_with_invoices._action_expense_create_transfer_moves()
+        return super(HrExpense, (self - expenses_with_invoices)).action_post()
+
+    def _do_reset_approval(self):
+        self.sudo().write({"invoice_id": False, "transfer_move_ids": []})
+        return super()._do_reset_approval()
+
+    def action_reset(self):
+        self = self.with_context(clean_context(self.env.context))
+        # Invoices
+        invoices_sudo = self.sudo().invoice_id
+        draft_invoices_sudo = invoices_sudo.filtered(lambda m: m.state == "draft")
+        non_draft_invoices_sudo = invoices_sudo - draft_invoices_sudo
+        non_draft_invoices_sudo._reverse_moves(
+            default_values_list=[
+                {"invoice_date": fields.Date.context_today(inv_sudo)}
+                for inv_sudo in non_draft_invoices_sudo
+            ],
+            cancel=True,
+        )
+        draft_invoices_sudo.unlink()
+        # Trasfers
+        transfers_sudo = self.sudo().transfer_move_ids
+        draft_transfers_sudo = transfers_sudo.filtered(lambda m: m.state == "draft")
+        non_draft_transfers_sudo = transfers_sudo - draft_transfers_sudo
+        non_draft_transfers_sudo._reverse_moves(
+            default_values_list=[
+                {"invoice_date": fields.Date.context_today(transfer_sudo)}
+                for transfer_sudo in non_draft_transfers_sudo
+            ],
+            cancel=True,
+        )
+        draft_transfers_sudo.unlink()
+        return super().action_reset()
